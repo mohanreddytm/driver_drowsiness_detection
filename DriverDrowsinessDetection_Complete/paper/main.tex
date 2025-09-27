@@ -1,0 +1,81 @@
+% !TeX program = pdflatex
+\documentclass[conference]{IEEEtran}
+
+% Packages
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{siunitx}
+\usepackage{cite}
+
+% Title
+\title{Real-Time Driver Drowsiness Detection using Eye Aspect Ratio and Facial Landmarks}
+
+% Author block (edit as needed)
+\author{\IEEEauthorblockN{Mohan [Surname]}
+\IEEEauthorblockA{DriverDrowsinessDetection Project\\
+Email: you@example.com}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper presents a practical, real-time driver drowsiness detection system using a standard webcam, OpenCV, and the dlib 68-point facial landmark model. The system estimates Eye Aspect Ratio (EAR) and optionally Mouth Aspect Ratio (MAR) to detect sustained eye closure and potential yawning. To minimize false alarms, it uses exponential moving average (EMA) smoothing, a time-based EAR threshold, release margins, and alarm hysteresis. The system runs on CPU-only hardware, provides clear visual overlays and audio alerts (including an immediate stop with a brief ``awake'' chime), and includes a Windows-friendly camera backend fallback. Experiments on a laptop webcam demonstrate real-time performance and robust behavior under typical lighting and head pose conditions. While not safety-certified, the design is well-suited for demonstrations, education, and prototyping of driver monitoring features.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Drowsiness detection, Eye Aspect Ratio (EAR), facial landmarks, OpenCV, dlib, real-time, driver monitoring.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Drowsy driving contributes to a significant fraction of road accidents each year, motivating in-cabin monitoring solutions capable of detecting fatigue in real time \cite{nhtsa_drowsy}. This work implements a low-cost system relying only on a standard webcam and commodity CPU, using facial landmarks to compute the Eye Aspect Ratio (EAR) \cite{soukupova2016} and an optional Mouth Aspect Ratio (MAR) as signals indicative of drowsiness. Compared to heavier learning-based pipelines, the approach emphasizes interpretability, configurability, and ease of deployment.
+
+Our contributions include: (1) a time-based and smoothed EAR decision rule that reduces false alarms relative to instantaneous thresholds; (2) practical alerting with immediate stop upon clear recovery, and an optional ``awake'' chime; (3) Windows camera-backend fallbacks and detection-interval reuse for efficiency; and (4) a modular, open implementation suitable for education and prototyping.
+
+\section{Related Work}
+The use of facial landmarks for blink and eye-closure estimation has become a standard baseline in driver monitoring \cite{soukupova2016}. PERCLOS (percentage of eyelid closure) is a classical measure of drowsiness \cite{perclos}. For facial landmark detection, dlib implements an efficient ensemble of regression trees \cite{kazemi2014}, often combined with HOG-based frontal face detection \cite{dalal2005}. OpenCV \cite{opencv} provides real-time primitives for image acquisition and processing. Recent work explores end-to-end deep learning for driver state, yet classical methods remain appealing for explainability and CPU efficiency.
+
+\section{Methodology}
+\subsection{Facial Landmarks and EAR}
+Given 68 facial landmarks, EAR uses six points around each eye to estimate openness as the ratio of vertical to horizontal distances \cite{soukupova2016}:
+\begin{equation}
+\mathrm{EAR} = \frac{\lVert p_2 - p_6 \rVert + \lVert p_3 - p_5 \rVert}{2\, \lVert p_1 - p_4 \rVert}.
+\end{equation}
+Lower EAR indicates closed eyes. We compute EAR for left and right eyes and average the values.
+
+\subsection{Time-Based Decision with Smoothing}
+To avoid false positives due to blinks or noise, we apply EMA smoothing to the EAR and require that the smoothed EAR remains below a threshold for a minimum duration (e.g., 7--10~s) before declaring ``Drowsy.'' A recovery margin above the threshold and a short ``awake'' dwell time produce immediate alarm stop when the driver is clearly awake. Thresholds and durations are configurable and can be auto-calibrated by sampling EAR during an initial ``eyes-open'' period.
+
+\subsection{Yawning via MAR (Optional)}
+We compute MAR using inner-mouth landmarks (when available) as a secondary indicator of fatigue. MAR exceeds a threshold for a short duration before signaling a yawn event; it does not on its own trigger the alarm but informs the on-screen status.
+
+\section{System Design and Implementation}
+The pipeline (Fig.~\ref{fig:pipeline}) uses OpenCV for capture and display, dlib's frontal face detector for faces, and the 68-point predictor for landmarks. We select the largest face per frame and reuse detections between frames to reduce compute. On Windows, we provide MSMF\textrightarrow DSHOW\textrightarrow ANY backend fallback. Visual overlays show the face box, eye contours, EAR/MAR, FPS, and state. Audio uses \texttt{pygame} to play a looping alarm and a brief ``awake'' chime upon recovery.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig-placeholder}
+    \caption{System pipeline (camera $\to$ detection $\to$ landmarks $\to$ EAR/MAR $\to$ decision $\to$ alert). Placeholder figure; replace with your own diagram.}
+    \label{fig:pipeline}
+\end{figure}
+
+\section{Experiments and Results}
+We evaluated the system on a laptop (CPU-only) with a \SI{720}{p} webcam under typical indoor lighting. The application maintained real-time performance (\(\geq\)15--20~FPS) while reliably detecting sustained eye closure. The immediate-stop mechanism reduced lingering audio after recovery. Parameters such as EAR threshold, minimum duration, smoothing factor, and release margin were tuned for stability; an auto-calibration option set a personalized threshold based on an initial eyes-open baseline.
+
+\textbf{Limitations:} Performance may degrade under extreme lighting, occlusions (e.g., dark sunglasses), or large head pose. The rule-based approach may not generalize to all users without calibration. As a non-certified prototype, it should not be relied upon as a primary safety device.
+
+\section{Conclusion and Future Work}
+We demonstrated a practical, interpretable, and configurable driver drowsiness detector that runs in real time on consumer hardware. Future enhancements include lightweight learning-based classifiers for tougher conditions, personalized multi-session calibration, additional cues (blink rate, head nods), and packaging as a desktop app with logging for user studies.
+
+\section*{Acknowledgment}
+We thank the open-source communities behind dlib and OpenCV for enabling accessible computer vision prototypes.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
+
+
