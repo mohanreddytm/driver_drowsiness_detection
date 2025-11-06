@@ -1,93 +1,50 @@
-Driver Drowsiness Detection (Python + OpenCV + dlib)
+# Driver Drowsiness Detection (Stable, Production-Ready)
 
-A modular, real-time driver drowsiness detection system using a webcam, OpenCV, dlib facial landmarks, and a loud alarm.
+Hybrid pipeline with Haar + ViT validation, CSRT/KCF tracking, EAR via landmarks fallback, and a robust 7-second drowsiness trigger.
 
-Features
-- Face and eye detection via dlib 68-point facial landmarks
-- Eye Aspect Ratio (EAR) to detect closed eyes across consecutive frames
-- Optional yawning detection using simple Mouth Aspect Ratio (MAR)
-- Visual overlays: face box, eye contours, EAR/MAR values, status text
-- Loud, looping alarm when drowsiness is detected
-- Clean quit with `q`
+## Quick Start
 
-Project Structure
-```
-main.py          # main application
-utils.py         # helper functions (EAR/MAR, model + alarm setup)
-requirements.txt # dependencies
-README.md        # this file
-alarm/alert.wav  # alarm sound (auto-generated if missing)
-models/          # shape_predictor_68_face_landmarks.dat (auto-downloaded if possible)
-```
-
-Setup (Windows / PowerShell)
-1. Create and activate a virtual environment (recommended):
-```powershell
+```bash
 python -m venv .venv
-. .venv\Scripts\Activate.ps1
-```
-
-2. Install dependencies:
-```powershell
+. .venv/Scripts/activate  # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-3. First run will try to download the dlib shape predictor (~100MB). If download fails, manually download and place the file:
-- File: `shape_predictor_68_face_landmarks.dat`
-- Place into folder: `models/`
-- Official URL: `http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2` (extract the `.bz2`)
-
-Run
-```powershell
 python main.py
 ```
-- Press `q` to quit cleanly.
 
-Advanced usage
-```powershell
-# Common options
-python main.py \
-  --camera 0 \
-  --width 960 \
-  --ear-threshold 0.25 \
-  --ear-consec-frames 20 \
-  --mar-threshold 0.60 \
-  --yawn-consec-frames 15 \
-  --off-frames 10 \
-  --show-fps
+- Press `q` to quit.
+- Set `DEBUG_MODE = True` in `main.py` to visualize Haar candidates, ViT conf, and smoothed boxes.
 
-# Disable audio or overlays if desired
-python main.py --no-audio --no-overlay
+## Requirements
+- Python 3.10+
+- Webcam
 
-# Select inner- or outer-mouth landmarks for MAR
-python main.py --use-inner-mouth
-python main.py --use-outer-mouth
+## Architecture
+- `main.py`: Orchestrates capture, periodic Haar+ViT, tracker lifecycle, EAR smoothing, and alerts.
+- `detector.py`: `run_haar_faces`, `run_nms`, `select_primary_face`, `validate_with_vit`, and eye cascade loader.
+- `tracker_wrapper.py`: CSRT/KCF tracker with health checks and smoothed box output.
+- `eyes.py`: Haar eye detection (top 40% ROI). Fallback to MediaPipe FaceMesh for precise EAR.
+- `drowsiness.py`: EAR smoothing buffer and 7-second consecutive-close timer with alert gating.
+- `utils.py`: CLAHE preprocessing, IoU, NMS, drawing helpers.
 
-# Use a specific model path
-python main.py --predictor models/shape_predictor_68_face_landmarks.dat
-```
+## Key Parameters
+- Frame: 640x480
+- Haar: scaleFactor=1.1, minNeighbors=5, minSize=(80,80)
+- NMS IoU: 0.3
+- ViT confidence threshold: 0.85 (validated every 5 frames)
+- Tracker: CSRT (fallback KCF)
+- Box smoothing: 7 frames
+- EAR smoothing: 7 frames
+- EAR threshold: 0.25
+- Drowsy trigger: 7.0 seconds
+- Eye ROI limit: top 40% of face ROI
 
-Notes on performance and accuracy
-- Largest-face selection improves robustness when multiple faces are in view.
-- FPS overlay (enable with `--show-fps`) helps assess real-time performance.
-- Alarm hysteresis (`--off-frames`) prevents chattering when EAR hovers near the threshold.
-- Inner-mouth MAR is used when available and is more consistent for yawning.
+## Notes
+- ViT runs every N frames to reduce load, tracker handles intermediate frames.
+- Only the primary face is tracked; all other boxes are suppressed via NMS + selection.
+- FaceMesh is used for precise EAR when available; otherwise, Haar eye boxes are used with an approximation.
 
-How it works
-- EAR formula: `(||p2 - p6|| + ||p3 - p5||) / (2 * ||p1 - p4||)`
-- If `EAR < 0.25` for `>= 20` consecutive frames → status: Drowsy → alarm plays in a loop.
-- Optional MAR checks mouth openness to hint yawning.
+## Testing
+- `test_detection.py` prints face detection + ViT confidence and EAR on sample images placed in `samples/`.
 
-Tuning
-- Update thresholds in `main.py`:
-  - `EAR_THRESHOLD` (typ. 0.20–0.30)
-  - `EAR_CONSEC_FRAMES` (typ. 15–30)
-  - `MAR_THRESHOLD` (typ. 0.55–0.70)
-  - `YAWN_CONSEC_FRAMES` (typ. 10–20)
-
-Notes
-- Ensure only one app uses the webcam.
-- If `pygame` audio fails, confirm your default output device is available.
-- dlib requires C++ build tools for source install; using a prebuilt wheel is recommended.
-
-
+## Cleanup
+The repo has been refactored to just the core modules above. Remove any legacy folders left from prior versions if still present.

@@ -7,8 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 import pyttsx3
+import sys
+import os
+
+# Ensure project root is on sys.path to import shared modules like utils.py
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if PROJECT_ROOT not in sys.path:
+	sys.path.insert(0, PROJECT_ROOT)
 
 from simple_drowsiness_detector import SimpleDrowsinessDetector
+from utils import play_alert_sound, stop_alert_sound  # default alert sound
 
 app = FastAPI()
 app.add_middleware(
@@ -26,12 +34,13 @@ _lock = threading.Lock()
 _custom_alert_message: Optional[str] = None
 _tts_engine: Optional[pyttsx3.Engine] = None
 
-# TTS loop state
+# Audio/TTS state
 _tts_thread: Optional[threading.Thread] = None
 _tts_stop_event: Optional[threading.Event] = None
 _tts_active: bool = False
+_audio_active: bool = False  # default beep from utils
 
-# Initialize TTS engine
+# Initialize TTS engine (kept but not used when default alert is active)
 try:
     _tts_engine = pyttsx3.init()
     _tts_engine.setProperty('rate', 150)
@@ -64,16 +73,23 @@ def _open_camera(index: int, width: int, height: int) -> Optional[cv2.VideoCaptu
 def start_detection(camera_index: int = 0, width: int = 640, height: int = 480, drowsy_duration_sec: float = 7.0) -> bool:
     global _detector, _capture, _running
     with _lock:
-        if _running and _capture is not None and _capture.isOpened():
+        if _running and _capture is not None and _capture.isOpened() and _detector is not None:
             return True
+        # Open camera first; only then create detector and mark running
+        capture = _open_camera(camera_index, width, height)
+        if capture is None or not capture.isOpened():
+            _running = False
+            _detector = None
+            _capture = None
+            return False
+        _capture = capture
         _detector = SimpleDrowsinessDetector(
             drowsy_duration_sec=drowsy_duration_sec,
             detection_interval=2,
             min_face_size=80,
         )
-        _capture = _open_camera(camera_index, width, height)
         _running = True
-        return _capture is not None and _capture.isOpened()
+        return True
 
 
 def stop_tts_loop():
@@ -96,37 +112,12 @@ def stop_tts_loop():
 
 
 def start_tts_loop():
-    global _tts_thread, _tts_stop_event, _tts_active
-    if _tts_engine is None:
-        return False
-    if not _custom_alert_message:
-        return False
-    if _tts_active:
-        return True
-    
-    # Stop any existing TTS first
-    stop_tts_loop()
-    
-    _tts_stop_event = threading.Event()
-    def _loop():
-        while not _tts_stop_event.is_set():
-            try:
-                _tts_engine.say(_custom_alert_message)
-                _tts_engine.runAndWait()
-                # Small pause between repeats
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"[TTS] Error: {e}")
-                time.sleep(0.5)
-    _tts_thread = threading.Thread(target=_loop, daemon=True)
-    _tts_thread.start()
-    _tts_active = True
-    print(f"[TTS] Loop started: '{_custom_alert_message}'")
-    return True
+    # TTS kept for compatibility but not used when default audio is preferred
+    return False
 
 
 def stop_detection():
-    global _detector, _capture, _running
+    global _detector, _capture, _running, _audio_active
     with _lock:
         _running = False
         if _capture is not None:
@@ -135,11 +126,13 @@ def stop_detection():
             except Exception:
                 pass
             _capture = None
-        if _detector is not None and _detector.audio_enabled:
+        # Stop any active audio
+        if _audio_active:
             try:
-                _detector.trigger_alarm(False)
+                stop_alert_sound()
             except Exception:
                 pass
+            _audio_active = False
         stop_tts_loop()
         _detector = None
 
@@ -165,14 +158,13 @@ async def api_health():
 
 @app.post("/api/set_alert_message")
 async def set_alert_message(alert: AlertMessage):
-    global _custom_alert_message
-    _custom_alert_message = alert.message.strip() if alert.message.strip() else None
-    return {"message": "Alert message updated", "current_message": _custom_alert_message}
+    # Default beep is used; TTS/custom message disabled intentionally
+    return {"message": "Default beep mode active", "current_message": None}
 
 
 @app.get("/api/get_alert_message")
 async def get_alert_message():
-    return {"message": _custom_alert_message}
+    return {"message": None}
 
 
 def _ensure_capture(width: int = 640, height: int = 480):
@@ -182,10 +174,16 @@ def _ensure_capture(width: int = 640, height: int = 480):
 
 
 def generate_mjpeg():
-    global _detector, _capture, _running, _tts_active
+    global _detector, _capture, _running, _audio_active
+    # Ensure detector exists
     if _detector is None:
-        return
+        if not start_detection():
+            return
     while _running:
+        if _detector is None:
+            time.sleep(0.05)
+            if not start_detection():
+                continue
         if _capture is None or not _capture.isOpened():
             _ensure_capture()
             time.sleep(0.05)
@@ -194,7 +192,8 @@ def generate_mjpeg():
         if not ok or frame is None:
             print("[WARN] Failed to read frame, reinitializing camera...")
             try:
-                _capture.release()
+                if _capture is not None:
+                    _capture.release()
             except Exception:
                 pass
             _capture = None
@@ -210,28 +209,27 @@ def generate_mjpeg():
             is_drowsy, confidence, _ = _detector.classify_drowsiness(ear)
             status = "Drowsy" if is_drowsy else "Active"
             alarm_active = _detector.update_drowsiness_state(is_drowsy)
-            
-            # Handle alarm activation/deactivation
-            if alarm_active:
-                # Start alarm if not already active
-                if not (_detector.alarm_active or _tts_active):
-                    if _custom_alert_message and _tts_engine is not None:
-                        start_tts_loop()
-                    else:
-                        _detector.trigger_alarm(True)
-            else:
-                # Stop alarm if leaving drowsy state
-                if _detector.alarm_active:
-                    _detector.trigger_alarm(False)
-                if _tts_active:
-                    stop_tts_loop()
+            # Default alert sound control
+            if alarm_active and not _audio_active:
+                try:
+                    play_alert_sound()
+                    _audio_active = True
+                except Exception as e:
+                    print(f"[AUDIO] start error: {e}")
+            elif not alarm_active and _audio_active:
+                try:
+                    stop_alert_sound()
+                except Exception as e:
+                    print(f"[AUDIO] stop error: {e}")
+                _audio_active = False
         else:
-            # No face detected -> stop any alarms and reset state
-            if _detector.alarm_active:
-                _detector.trigger_alarm(False)
-            if _tts_active:
-                stop_tts_loop()
-            # Reset drowsiness state when no face is detected
+            # No face detected -> stop audio and reset state
+            if _audio_active:
+                try:
+                    stop_alert_sound()
+                except Exception:
+                    pass
+                _audio_active = False
             _detector._below_start_time = None
         frame = _detector.draw_overlays(frame, faces, eyes, status, confidence, ear, alarm_active)
         ret, jpeg = cv2.imencode('.jpg', frame)
@@ -243,7 +241,7 @@ def generate_mjpeg():
 
 @app.get("/api/stream")
 async def stream():
-    if not _running:
+    if not _running or _detector is None:
         ok = start_detection()
         if not ok:
             raise HTTPException(status_code=500, detail="Failed to open camera. Try hitting /api/start?camera=1 or close other apps using the camera.")
@@ -272,7 +270,7 @@ async def ws_status(ws: WebSocket):
                 "status": status,
                 "elapsed": round(elapsed, 2),
                 "target": _detector.drowsy_duration_sec,
-                "alarm": _detector.alarm_active or _tts_active,
+                "alarm": _audio_active,
             })
     except WebSocketDisconnect:
         pass

@@ -48,7 +48,7 @@ export default function AlertMessageSettings() {
           onChange={(e) => setMessage(e.target.value)}
           placeholder="Enter custom alert message (e.g., 'Hey Ravi, wake up!')"
           style={{
-            width: '100%',
+            width: '90%',
             padding: '8px 12px',
             border: '1px solid #ccc',
             borderRadius: 4,
@@ -79,9 +79,9 @@ export default function AlertMessageSettings() {
           disabled={loading}
           style={{
             padding: '8px 16px',
-            backgroundColor: '#f44336',
-            color: 'white',
-            border: 'none',
+            backgroundColor: '#fff',
+            color: 'red',
+            border: '1px solid red',
             borderRadius: 4,
             cursor: loading ? 'not-allowed' : 'pointer',
             opacity: loading ? 0.6 : 1

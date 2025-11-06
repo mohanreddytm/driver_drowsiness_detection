@@ -15,6 +15,7 @@ import time
 import argparse
 import os
 from collections import deque
+import logging
 
 
 class SimpleDrowsinessDetector:
@@ -47,11 +48,19 @@ class SimpleDrowsinessDetector:
         # Initialize Haar cascades
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-        
+
         if self.face_cascade.empty() or self.eye_cascade.empty():
             raise RuntimeError("Failed to load Haar cascade classifiers")
-        
+
         print("[INFO] Loaded Haar cascade classifiers")
+        logging.basicConfig(level=logging.INFO)
+
+        # Optional DNN-based face detector (Res10 SSD) for improved accuracy.
+        self.use_dnn = True
+        self.dnn_confidence = 0.5
+        self.model_dir = "models"
+        self.dnn_net = None
+        self._load_dnn_model()
         
         # Initialize audio system
         self.audio_enabled = self._init_audio()
@@ -78,6 +87,34 @@ class SimpleDrowsinessDetector:
         except Exception as e:
             print(f"[WARN] Audio initialization failed: {e}")
             return False
+
+    def _load_dnn_model(self):
+        """Try to load the lightweight OpenCV DNN face detector model.
+
+        The code will look for the model files in `self.model_dir`:
+          - deploy.prototxt
+          - res10_300x300_ssd_iter_140000.caffemodel
+
+        If they are not present the detector will continue using Haar cascades.
+        """
+        if not self.use_dnn:
+            logging.info("DNN face detector disabled by configuration")
+            return
+
+        proto = os.path.join(self.model_dir, "deploy.prototxt")
+        model = os.path.join(self.model_dir, "res10_300x300_ssd_iter_140000.caffemodel")
+        if os.path.exists(proto) and os.path.exists(model):
+            try:
+                self.dnn_net = cv2.dnn.readNetFromCaffe(proto, model)
+                # Prefer CPU backend by default (works on most Windows setups)
+                self.dnn_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                self.dnn_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                logging.info(f"[INFO] Loaded DNN face detector from {self.model_dir}")
+            except Exception as e:
+                logging.warning(f"[WARN] Failed to load DNN model: {e}")
+                self.dnn_net = None
+        else:
+            logging.info("[INFO] DNN model files not found in '%s' - falling back to Haar cascades", self.model_dir)
     
     def detect_faces_and_eyes(self, frame: np.ndarray) -> tuple:
         """
@@ -104,58 +141,91 @@ class SimpleDrowsinessDetector:
                 eyes.append((x + ex, y + ey, ew, eh))
             return [self.last_face_region], eyes
         
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Apply multiple preprocessing techniques for better detection
-        # 1. CLAHE for better contrast in low light
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray_enhanced = clahe.apply(gray)
-        
-        # 2. Gaussian blur to reduce noise
-        gray_enhanced = cv2.GaussianBlur(gray_enhanced, (3, 3), 0)
-        
-        # 3. Histogram equalization as backup
-        gray_hist = cv2.equalizeHist(gray)
-        
-        # Try multiple detection approaches
+        # For performance, run detection on a resized copy if frame is large
+        h, w = frame.shape[:2]
+        target_max = 800
+        scale = 1.0
+        small = frame
+        if max(w, h) > target_max:
+            scale = target_max / float(max(w, h))
+            small = cv2.resize(frame, (int(w * scale), int(h * scale)))
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        # First try DNN face detector if available
         faces = []
-        
-        # Method 1: Enhanced image with CLAHE
-        faces1 = self.face_cascade.detectMultiScale(
-            gray_enhanced,
-            scaleFactor=1.05,
-            minNeighbors=4,
-            minSize=(self.min_face_size, self.min_face_size),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        faces.extend(faces1)
-        
-        # Method 2: Histogram equalized image (if no faces found)
+        if self.dnn_net is not None:
+            try:
+                blob = cv2.dnn.blobFromImage(cv2.resize(small, (300, 300)), 1.0,
+                                             (300, 300), (104.0, 177.0, 123.0))
+                self.dnn_net.setInput(blob)
+                detections = self.dnn_net.forward()
+                (dh, dw) = small.shape[:2]
+                for i in range(0, detections.shape[2]):
+                    confidence = float(detections[0, 0, i, 2])
+                    if confidence < self.dnn_confidence:
+                        continue
+                    box = detections[0, 0, i, 3:7] * np.array([dw, dh, dw, dh])
+                    (startX, startY, endX, endY) = box.astype("int")
+                    wbox = endX - startX
+                    hbox = endY - startY
+                    if wbox < int(self.min_face_size * scale) or hbox < int(self.min_face_size * scale):
+                        continue
+                    # Scale box back to original frame coordinates
+                    sx = int(startX / scale)
+                    sy = int(startY / scale)
+                    ex = int(endX / scale)
+                    ey = int(endY / scale)
+                    faces.append((sx, sy, ex - sx, ey - sy))
+                if len(faces) > 0:
+                    logging.debug(f"[DNN] Detected {len(faces)} faces")
+            except Exception as e:
+                logging.warning(f"[WARN] DNN detection failed, falling back to Haar: {e}")
+
+        # If DNN not used or found nothing, fallback to Haar cascades with enhanced preprocessing
         if len(faces) == 0:
-            faces2 = self.face_cascade.detectMultiScale(
-                gray_hist,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(self.min_face_size, self.min_face_size),
+            # Apply multiple preprocessing techniques for better detection
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray_enhanced = clahe.apply(gray)
+            gray_enhanced = cv2.GaussianBlur(gray_enhanced, (3, 3), 0)
+            gray_hist = cv2.equalizeHist(gray)
+
+            # Method 1: Enhanced image with CLAHE
+            faces1 = self.face_cascade.detectMultiScale(
+                gray_enhanced,
+                scaleFactor=1.05,
+                minNeighbors=4,
+                minSize=(int(self.min_face_size * scale), int(self.min_face_size * scale)),
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
-            faces.extend(faces2)
-        
-        # Method 3: Original grayscale (if still no faces)
-        if len(faces) == 0:
-            faces3 = self.face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(self.min_face_size, self.min_face_size),
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-            faces.extend(faces3)
-        
+            faces.extend([(int(x/scale), int(y/scale), int(w/scale), int(h/scale)) for (x, y, w, h) in faces1])
+
+            # Method 2: Histogram equalized image (if no faces found)
+            if len(faces) == 0:
+                faces2 = self.face_cascade.detectMultiScale(
+                    gray_hist,
+                    scaleFactor=1.1,
+                    minNeighbors=3,
+                    minSize=(int(self.min_face_size * scale), int(self.min_face_size * scale)),
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+                faces.extend([(int(x/scale), int(y/scale), int(w/scale), int(h/scale)) for (x, y, w, h) in faces2])
+
+            # Method 3: Original grayscale (if still no faces)
+            if len(faces) == 0:
+                faces3 = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(int(self.min_face_size * scale), int(self.min_face_size * scale)),
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+                faces.extend([(int(x/scale), int(y/scale), int(w/scale), int(h/scale)) for (x, y, w, h) in faces3])
+
         # Remove duplicate faces (if any)
         if len(faces) > 1:
             faces = self._remove_duplicate_faces(faces)
-        
+
         # Store the largest face for reuse
         if len(faces) > 0:
             self.last_face_region = max(faces, key=lambda f: f[2] * f[3])
@@ -165,17 +235,50 @@ class SimpleDrowsinessDetector:
         # Detect eyes (only in face regions for efficiency)
         eyes = []
         for (x, y, w, h) in faces:
-            # Use enhanced image for eye detection
-            face_roi = gray_enhanced[y:y+h, x:x+w]
+            # Use enhanced image for eye detection; limit search to upper part of face
+            fx1, fy1, fw, fh = int(x), int(y), int(w), int(h)
+            face_roi = gray_enhanced[0:0+1, 0:0+1]  # fallback
+            try:
+                face_roi = gray_enhanced[int((y)/scale):int((y+h)/scale), int((x)/scale):int((x+w)/scale)]
+            except Exception:
+                # Fallback to using small-scale gray if indexing fails
+                face_roi = gray
+
+            # Restrict to upper portion of the face where eyes reside (upper 60%)
+            upper_h = max(1, int(face_roi.shape[0] * 0.6))
+            eye_search_roi = face_roi[0:upper_h, :]
+
+            # Tune detection parameters to reduce false positives
             face_eyes = self.eye_cascade.detectMultiScale(
-                face_roi,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(25, 25)
+                eye_search_roi,
+                scaleFactor=1.12,
+                minNeighbors=5,
+                minSize=(max(10, int(fw * 0.08)), max(10, int(fh * 0.04)))
             )
-            # Convert eye coordinates back to full frame
+
+            # Convert eye coordinates back to original frame coordinates and filter
+            candidates = []
             for (ex, ey, ew, eh) in face_eyes:
-                eyes.append((x + ex, y + ey, ew, eh))
+                # Map coords from roi back to original image (we used scaled coords earlier)
+                mapped_x = int(x + (ex * (1.0/scale)))
+                mapped_y = int(y + (ey * (1.0/scale)))
+                mapped_w = int(ew * (1.0/scale))
+                mapped_h = int(eh * (1.0/scale))
+
+                # Basic geometric filters: eye width should be a reasonable fraction of face width
+                if mapped_w < max(8, int(w * 0.06)) or mapped_w > int(w * 0.6):
+                    continue
+                # Aspect ratio (height/width) for an eye-like box
+                ar = mapped_h / float(max(1, mapped_w))
+                if ar < 0.12 or ar > 0.9:
+                    continue
+
+                candidates.append((mapped_x, mapped_y, mapped_w, mapped_h))
+
+            # Keep up to two largest eye candidates per face (prefer larger, likely true eyes)
+            candidates = sorted(candidates, key=lambda r: r[2] * r[3], reverse=True)[:2]
+            for c in candidates:
+                eyes.append(c)
         
         return faces, eyes
     
