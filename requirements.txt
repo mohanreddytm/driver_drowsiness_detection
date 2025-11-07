@@ -1,8 +1,7 @@
 opencv-contrib-python
-mediapipe
 torch
 torchvision
 numpy
 playsound
-simpleaudio
+pyttsx3
 

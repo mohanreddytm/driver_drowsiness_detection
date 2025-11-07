@@ -124,6 +124,12 @@ def current_sound_backend() -> str:
 	return _backend
 
 
+def is_alert_sound_playing() -> bool:
+	"""Check if alert sound is currently playing."""
+	global _sound_thread
+	return _sound_thread is not None and _sound_thread.is_alive()
+
+
 def _ensure_default_beep_wav() -> Optional[str]:
 	"""Create a short sine beep wav in temp dir and cache path (non-Windows fallback)."""
 	global _default_beep_wav
@@ -169,13 +175,6 @@ def audio_self_test() -> None:
 		except Exception:
 			pass
 	wav = _ensure_default_beep_wav()
-	if wav and sa is not None:
-		try:
-			wo = sa.WaveObject.from_wave_file(wav)
-			wo.play().wait_done()
-			return
-		except Exception:
-			pass
 	if wav:
 		try:
 			playsound(wav, block=True)
@@ -195,64 +194,142 @@ def audio_self_test() -> None:
 def play_alert_sound() -> None:
 	"""
 	Start a continuous, non-blocking default alert sound.
-	- Windows: Beep loop in a background thread.
-	- macOS/Linux: loop generated WAV with simpleaudio if available; else playsound; else OS-level tools.
+	- Windows: Continuous alarm.wav loop in a background thread (NO GAPS!).
+	- macOS/Linux: loop alarm.wav with playsound; else OS-level tools.
 	"""
 	global _sound_thread, _stop_flag, _backend
 
-	if _sound_thread is not None and _sound_thread.is_alive():
-		return
+	# Always restart if thread is dead or not running
+	if _sound_thread is not None:
+		if _sound_thread.is_alive():
+			# Thread is alive, don't restart
+			print("[ALARM] Sound thread already running, not restarting")
+			return
+		else:
+			# Thread is dead, clean up and restart
+			print("[ALARM] Sound thread is dead, cleaning up and restarting")
+			_sound_thread = None
 
+	# Reset stop flag before starting
 	_stop_flag = False
+	print("[ALARM] Stop flag reset, starting new sound thread")
 
 	def loop_sound() -> None:
+		"""Continuous sound loop - plays sound continuously with NO GAPS!"""
 		global _stop_flag, _backend
 		sysname_local = platform.system()
+		print(f"[ALARM] Starting continuous alarm sound loop (platform: {sysname_local})")
+		
+		# Try to use alarm/alert.wav file first, fallback to beep
+		alarm_wav = None
+		alarm_paths = ["alarm/alert.wav", "alert.wav", os.path.join(os.path.dirname(__file__), "alarm", "alert.wav")]
+		for path in alarm_paths:
+			if os.path.exists(path):
+				alarm_wav = path
+				print(f"[ALARM] Using alarm file: {alarm_wav}")
+				break
+		
 		while not _stop_flag:
 			try:
+				# Try to use alarm.wav file if available (better sound!)
+				if alarm_wav and os.path.exists(alarm_wav):
+					_backend = f"playsound({alarm_wav})"
+					try:
+						# Play the WAV file - this will block until it finishes
+						playsound(alarm_wav, block=True)
+						# After playing, check if we should continue or stop
+						if _stop_flag:
+							print("[ALARM] Stop flag set, exiting loop")
+							break
+						# Play again immediately for continuous sound (NO GAPS!)
+						# Don't sleep - just continue the loop
+						continue
+					except Exception as e:
+						print(f"[ALARM] Error playing alarm.wav: {e}, falling back to beep")
+						# Fallback to beep - don't set alarm_wav to None yet, try once more
+						# If it fails again, we'll fall through to beep
+						pass
+				
+				# Fallback to beep if alarm.wav not available or failed
 				if sysname_local == "Windows" and winsound is not None:
-					_backend = "winsound.Beep(loop)"
-					winsound.Beep(2000, 700)
+					_backend = "winsound.Beep(continuous)"
+					# Play beep continuously - NO GAPS! 
+					# Use longer beeps with minimal gap for truly continuous sound
+					winsound.Beep(2000, 800)  # 800ms beep (longer = less gaps)
+					# Almost no sleep - just enough to allow next beep to start
+					if not _stop_flag:
+						time.sleep(0.01)  # TINY gap (10ms) - almost continuous!
+					# Continue loop immediately for next beep
+					continue
 				elif sysname_local == "Darwin":
 					wav = _ensure_default_beep_wav()
-					if wav and sa is not None:
-						_backend = "simpleaudio(macOS)"
-						wo = sa.WaveObject.from_wave_file(wav)
-						wo.play().wait_done()
-					elif _run_cmd(["afplay", "/System/Library/Sounds/Glass.aiff"]):
-						_backend = "afplay"
+					_backend = "afplay|playsound(macOS)"
+					if wav:
+						# Try afplay first (non-blocking)
+						if not _run_cmd(["afplay", wav]):
+							# Fallback to playsound (blocking)
+							playsound(wav, block=True)
 					else:
-						_backend = "playsound(macOS)"
-						playsound(wav, block=True) if wav else time.sleep(0.7)
+						time.sleep(0.5)
 				elif sysname_local == "Linux":
 					wav = _ensure_default_beep_wav()
-					if wav and sa is not None:
-						_backend = "simpleaudio(linux)"
-						wo = sa.WaveObject.from_wave_file(wav)
-						wo.play().wait_done()
-					elif wav:
-						_backend = "playsound(linux)"
-						playsound(wav, block=True)
-					elif _run_cmd(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"]) or \
-						_run_cmd(["aplay", "/usr/share/sounds/alsa/Front_Center.wav"]) or \
-						_run_cmd(["beep", "-f", "2000", "-l", "700"]):
-						_backend = "os-cmd(linux)"
+					_backend = "playsound|os-cmd(linux)"
+					if wav:
+						try:
+							playsound(wav, block=True)
+						except Exception:
+							# Try OS-level commands
+							if not (_run_cmd(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"]) or 
+							        _run_cmd(["aplay", "/usr/share/sounds/alsa/Front_Center.wav"]) or 
+							        _run_cmd(["beep", "-f", "2000", "-l", "500"])):
+								time.sleep(0.5)
 					else:
-						_backend = "sleep-fallback"
-						time.sleep(0.7)
-				time.sleep(0.3)
+						time.sleep(0.5)
+				else:
+					# Unknown platform - use WAV file
+					wav = _ensure_default_beep_wav()
+					if wav:
+						try:
+							playsound(wav, block=True)
+						except Exception:
+							time.sleep(0.5)
+					else:
+						time.sleep(0.5)
+				
+				# Only sleep if we're not on Windows (Windows handles it differently)
+				if sysname_local != "Windows":
+					if not _stop_flag:
+						time.sleep(0.1)  # Small gap between sound plays
+					else:
+						break  # Stop flag set, exit
+				else:
+					# Windows - already handled with continue above
+					pass
 			except Exception as e:
-				print("Sound error:", e)
+				print(f"[ALARM] Sound error in loop: {e}")
+				import traceback
+				traceback.print_exc()
 				_backend = "error"
-				time.sleep(1.0)
+				if _stop_flag:
+					print("[ALARM] Stop flag set during error, exiting")
+					break
+				time.sleep(0.5)  # Wait before retrying
+		
+		print("[ALARM] Alarm sound loop stopped (stop_flag was set)")
 
 	_sound_thread = threading.Thread(target=loop_sound, daemon=True)
 	_sound_thread.start()
-	print("[sound] backend:", _backend or "initializing")
+	print(f"[ALARM] Alarm sound thread started (thread ID: {_sound_thread.ident})")
 
 
 def stop_alert_sound() -> None:
-	"""Stop any currently playing alert sound."""
-	global _stop_flag, _backend
+	"""Stop any currently playing alert sound and clear thread ref for future cycles."""
+	global _stop_flag, _sound_thread, _backend
 	_stop_flag = True
+	try:
+		if _sound_thread is not None:
+			_sound_thread.join(timeout=1.0)
+	except Exception:
+		pass
+	_sound_thread = None
 	_backend = ""

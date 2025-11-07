@@ -3,9 +3,17 @@ Simplified Driver Drowsiness Detection System
 Using only OpenCV and basic computer vision techniques for maximum compatibility.
 
 This version uses:
-- Haar Cascade for face and eye detection
+- Haar Cascade for face and eye detection (with optional DNN fallback)
 - Eye Aspect Ratio (EAR) for drowsiness detection
-- Simple threshold-based classification
+- Temporal smoothing to reduce flickering in face/eye detection
+- Exponential moving average for stable position tracking
+- Optimized detection parameters for better stability
+
+Improvements:
+- Temporal smoothing: Reduces flickering by applying exponential moving average
+- Face position tracking: Maintains detection for up to 5 frames even if temporarily lost
+- Eye position matching: Matches eyes across frames for smooth tracking
+- Enhanced detection parameters: Increased minNeighbors for better stability
 """
 
 import cv2
@@ -73,6 +81,14 @@ class SimpleDrowsinessDetector:
         self.frame_count = 0
         self._below_start_time = None  # time when EAR went below threshold
         
+        # Temporal smoothing for face and eye positions (reduces flickering)
+        self.smoothed_face = None  # (x, y, w, h) with exponential moving average
+        self.smoothed_eyes = []  # List of smoothed eye positions
+        self.face_smoothing_alpha = 0.7  # Higher = more responsive, lower = more stable (0.0-1.0)
+        self.eye_smoothing_alpha = 0.6
+        self.face_miss_count = 0  # Count consecutive frames without face
+        self.max_face_miss = 5  # Keep smoothed face for N frames even if not detected
+        
     def _init_audio(self) -> bool:
         """Initialize pygame audio system."""
         try:
@@ -116,9 +132,80 @@ class SimpleDrowsinessDetector:
         else:
             logging.info("[INFO] DNN model files not found in '%s' - falling back to Haar cascades", self.model_dir)
     
+    def _smooth_face_position(self, new_face):
+        """Apply exponential moving average to face position for stability."""
+        if new_face is None:
+            self.face_miss_count += 1
+            if self.face_miss_count > self.max_face_miss:
+                self.smoothed_face = None
+            return self.smoothed_face
+        
+        self.face_miss_count = 0
+        x, y, w, h = new_face
+        
+        if self.smoothed_face is None:
+            self.smoothed_face = (float(x), float(y), float(w), float(h))
+        else:
+            sx, sy, sw, sh = self.smoothed_face
+            # Exponential moving average
+            self.smoothed_face = (
+                self.face_smoothing_alpha * x + (1 - self.face_smoothing_alpha) * sx,
+                self.face_smoothing_alpha * y + (1 - self.face_smoothing_alpha) * sy,
+                self.face_smoothing_alpha * w + (1 - self.face_smoothing_alpha) * sw,
+                self.face_smoothing_alpha * h + (1 - self.face_smoothing_alpha) * sh
+            )
+        
+        # Return as integer tuple
+        return (int(self.smoothed_face[0]), int(self.smoothed_face[1]), 
+                int(self.smoothed_face[2]), int(self.smoothed_face[3]))
+    
+    def _smooth_eye_positions(self, new_eyes):
+        """Apply exponential moving average to eye positions for stability."""
+        if not new_eyes:
+            # If no eyes detected, keep smoothed eyes for a few frames
+            if len(self.smoothed_eyes) > 0:
+                return self.smoothed_eyes
+            return []
+        
+        # Match new eyes to smoothed eyes by position (simple nearest neighbor)
+        smoothed = []
+        for new_eye in new_eyes[:2]:  # Max 2 eyes
+            nx, ny, nw, nh = new_eye
+            
+            # Find closest smoothed eye
+            best_match = None
+            best_dist = float('inf')
+            for i, (sx, sy, sw, sh) in enumerate(self.smoothed_eyes):
+                # Distance between centers
+                dist = ((nx + nw/2) - (sx + sw/2))**2 + ((ny + nh/2) - (sy + sh/2))**2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_match = i
+            
+            if best_match is not None and best_dist < (nw * nh):  # Within reasonable distance
+                # Update existing smoothed eye
+                sx, sy, sw, sh = self.smoothed_eyes[best_match]
+                smoothed.append((
+                    int(self.eye_smoothing_alpha * nx + (1 - self.eye_smoothing_alpha) * sx),
+                    int(self.eye_smoothing_alpha * ny + (1 - self.eye_smoothing_alpha) * sy),
+                    int(self.eye_smoothing_alpha * nw + (1 - self.eye_smoothing_alpha) * sw),
+                    int(self.eye_smoothing_alpha * nh + (1 - self.eye_smoothing_alpha) * sh)
+                ))
+            else:
+                # New eye, add it
+                smoothed.append((int(nx), int(ny), int(nw), int(nh)))
+        
+        # Keep only 2 eyes, sorted left to right
+        if len(smoothed) > 2:
+            smoothed = sorted(smoothed, key=lambda e: e[0])[:2]
+        
+        self.smoothed_eyes = smoothed
+        return smoothed
+    
     def detect_faces_and_eyes(self, frame: np.ndarray) -> tuple:
         """
         Detect faces and eyes in the frame with improved preprocessing and multiple detection methods.
+        Uses temporal smoothing to reduce flickering.
         
         Returns:
             Tuple of (faces, eyes) where each is a list of (x, y, w, h) tuples
@@ -126,7 +213,7 @@ class SimpleDrowsinessDetector:
         # Only run detection every N frames for efficiency
         self.frame_count += 1
         if self.frame_count % self.detection_interval != 0 and self.last_face_region is not None:
-            # Reuse last detection result for eyes
+            # Reuse last detection result for eyes, but still apply smoothing
             x, y, w, h = self.last_face_region
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             face_roi = gray[y:y+h, x:x+w]
@@ -134,12 +221,16 @@ class SimpleDrowsinessDetector:
             face_eyes = self.eye_cascade.detectMultiScale(
                 face_roi,
                 scaleFactor=1.1,
-                minNeighbors=3,
+                minNeighbors=4,  # Increased for stability
                 minSize=(25, 25)
             )
             for (ex, ey, ew, eh) in face_eyes:
                 eyes.append((x + ex, y + ey, ew, eh))
-            return [self.last_face_region], eyes
+            
+            # Apply smoothing
+            smoothed_face = self._smooth_face_position(self.last_face_region)
+            smoothed_eyes = self._smooth_eye_positions(eyes)
+            return ([smoothed_face] if smoothed_face else []), smoothed_eyes
         
         # For performance, run detection on a resized copy if frame is large
         h, w = frame.shape[:2]
@@ -151,6 +242,12 @@ class SimpleDrowsinessDetector:
             small = cv2.resize(frame, (int(w * scale), int(h * scale)))
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        
+        # Preprocess gray image for eye detection (always create enhanced version)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray)
+        gray_enhanced = cv2.GaussianBlur(gray_enhanced, (3, 3), 0)
+        gray_hist = cv2.equalizeHist(gray)
 
         # First try DNN face detector if available
         faces = []
@@ -184,13 +281,7 @@ class SimpleDrowsinessDetector:
 
         # If DNN not used or found nothing, fallback to Haar cascades with enhanced preprocessing
         if len(faces) == 0:
-            # Apply multiple preprocessing techniques for better detection
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            gray_enhanced = clahe.apply(gray)
-            gray_enhanced = cv2.GaussianBlur(gray_enhanced, (3, 3), 0)
-            gray_hist = cv2.equalizeHist(gray)
-
-            # Method 1: Enhanced image with CLAHE
+            # Method 1: Enhanced image with CLAHE (gray_enhanced already created above)
             faces1 = self.face_cascade.detectMultiScale(
                 gray_enhanced,
                 scaleFactor=1.05,
@@ -232,38 +323,70 @@ class SimpleDrowsinessDetector:
         else:
             self.last_face_region = None
         
+        # Apply temporal smoothing to face position
+        smoothed_face = self._smooth_face_position(self.last_face_region)
+        
+        # Use smoothed face for eye detection if available
+        face_for_eye_detection = smoothed_face if smoothed_face else (self.last_face_region if self.last_face_region else None)
+        
         # Detect eyes (only in face regions for efficiency)
         eyes = []
-        for (x, y, w, h) in faces:
-            # Use enhanced image for eye detection; limit search to upper part of face
-            fx1, fy1, fw, fh = int(x), int(y), int(w), int(h)
+        if face_for_eye_detection:
+            x, y, w, h = face_for_eye_detection
+            # Convert to scaled coordinates for ROI extraction (face coords are in original frame)
+            x_scaled = int(x * scale)
+            y_scaled = int(y * scale)
+            w_scaled = int(w * scale)
+            h_scaled = int(h * scale)
+            
+            # Ensure coordinates are within bounds
+            h_img, w_img = gray_enhanced.shape[:2]
+            x_scaled = max(0, min(x_scaled, w_img - 1))
+            y_scaled = max(0, min(y_scaled, h_img - 1))
+            w_scaled = min(w_scaled, w_img - x_scaled)
+            h_scaled = min(h_scaled, h_img - y_scaled)
+            
             face_roi = gray_enhanced[0:0+1, 0:0+1]  # fallback
             try:
-                face_roi = gray_enhanced[int((y)/scale):int((y+h)/scale), int((x)/scale):int((x+w)/scale)]
+                # Extract face ROI from scaled image
+                if w_scaled > 0 and h_scaled > 0:
+                    face_roi = gray_enhanced[y_scaled:y_scaled+h_scaled, x_scaled:x_scaled+w_scaled]
+                else:
+                    face_roi = gray
             except Exception:
                 # Fallback to using small-scale gray if indexing fails
-                face_roi = gray
+                try:
+                    if w_scaled > 0 and h_scaled > 0:
+                        face_roi = gray[y_scaled:y_scaled+h_scaled, x_scaled:x_scaled+w_scaled]
+                    else:
+                        face_roi = gray
+                except Exception:
+                    face_roi = gray
 
             # Restrict to upper portion of the face where eyes reside (upper 60%)
             upper_h = max(1, int(face_roi.shape[0] * 0.6))
             eye_search_roi = face_roi[0:upper_h, :]
 
-            # Tune detection parameters to reduce false positives
+            # Tune detection parameters to reduce false positives (increased minNeighbors for stability)
+            # Calculate min eye size based on face dimensions (in scaled coordinates)
+            min_eye_w = max(10, int(w_scaled * 0.08))
+            min_eye_h = max(10, int(h_scaled * 0.04))
             face_eyes = self.eye_cascade.detectMultiScale(
                 eye_search_roi,
                 scaleFactor=1.12,
-                minNeighbors=5,
-                minSize=(max(10, int(fw * 0.08)), max(10, int(fh * 0.04)))
+                minNeighbors=6,  # Increased from 5 for better stability
+                minSize=(min_eye_w, min_eye_h)
             )
 
             # Convert eye coordinates back to original frame coordinates and filter
             candidates = []
             for (ex, ey, ew, eh) in face_eyes:
-                # Map coords from roi back to original image (we used scaled coords earlier)
-                mapped_x = int(x + (ex * (1.0/scale)))
-                mapped_y = int(y + (ey * (1.0/scale)))
-                mapped_w = int(ew * (1.0/scale))
-                mapped_h = int(eh * (1.0/scale))
+                # Map coords from roi back to original image (eyes are in scaled ROI coordinates)
+                # ROI starts at (x_scaled, y_scaled) in scaled image, so add that offset
+                mapped_x = int(x + (ex / scale))
+                mapped_y = int(y + (ey / scale))
+                mapped_w = int(ew / scale)
+                mapped_h = int(eh / scale)
 
                 # Basic geometric filters: eye width should be a reasonable fraction of face width
                 if mapped_w < max(8, int(w * 0.06)) or mapped_w > int(w * 0.6):
@@ -280,7 +403,11 @@ class SimpleDrowsinessDetector:
             for c in candidates:
                 eyes.append(c)
         
-        return faces, eyes
+        # Apply temporal smoothing to eye positions
+        smoothed_eyes = self._smooth_eye_positions(eyes)
+        
+        # Return smoothed results
+        return ([smoothed_face] if smoothed_face else []), smoothed_eyes
     
     def _remove_duplicate_faces(self, faces: list) -> list:
         """
@@ -425,16 +552,48 @@ class SimpleDrowsinessDetector:
         Draw bounding boxes and status overlays on the frame.
         """
         # Draw face bounding boxes
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, "Face", (x, y - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for face in faces:
+            try:
+                # Ensure coordinates are integers and valid
+                if len(face) != 4:
+                    continue
+                x, y, w, h = face
+                x, y, w, h = int(x), int(y), int(w), int(h)
+                # Validate coordinates are within frame bounds
+                if x < 0 or y < 0 or w <= 0 or h <= 0:
+                    continue
+                if x + w > frame.shape[1] or y + h > frame.shape[0]:
+                    # Clamp to frame bounds
+                    w = min(w, frame.shape[1] - x)
+                    h = min(h, frame.shape[0] - y)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, "Face", (x, max(0, y - 10)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            except (ValueError, TypeError, IndexError) as e:
+                print(f"[WARN] Invalid face coordinates: {face}, error: {e}")
+                continue
         
         # Draw eye bounding boxes
-        for (x, y, w, h) in eyes:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-            cv2.putText(frame, "Eye", (x, y - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        for eye in eyes:
+            try:
+                # Ensure coordinates are integers and valid
+                if len(eye) != 4:
+                    continue
+                x, y, w, h = eye
+                x, y, w, h = int(x), int(y), int(w), int(h)
+                # Validate coordinates are within frame bounds
+                if x < 0 or y < 0 or w <= 0 or h <= 0:
+                    continue
+                if x + w > frame.shape[1] or y + h > frame.shape[0]:
+                    # Clamp to frame bounds
+                    w = min(w, frame.shape[1] - x)
+                    h = min(h, frame.shape[0] - y)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.putText(frame, "Eye", (x, max(0, y - 10)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            except (ValueError, TypeError, IndexError) as e:
+                print(f"[WARN] Invalid eye coordinates: {eye}, error: {e}")
+                continue
         
         # Determine display status and color based on current state and elapsed time
         display_status = "Active"

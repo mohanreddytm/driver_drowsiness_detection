@@ -2,12 +2,12 @@
 drowsiness.py
 
 EAR smoothing, consecutive closed-time tracking, and drowsiness alert gating.
-Starts and stops continuous default alert sound using utils.play_alert_sound/stop_alert_sound.
+Starts and stops continuous alert sound using utils.play_alert_sound/stop_alert_sound.
 """
 
 import time
 from collections import deque
-from typing import Deque, Tuple
+from typing import Deque, Tuple, Optional
 
 from utils import play_alert_sound, stop_alert_sound
 
@@ -28,12 +28,13 @@ class EarSmoother:
 
 
 class DrowsinessTimer:
-	def __init__(self, threshold_ear: float = 0.25, trigger_seconds: float = 7.0) -> None:
+	def __init__(self, threshold_ear: float = 0.25, trigger_seconds: float = 7.0, custom_sound: Optional[str] = None) -> None:
 		self.threshold_ear = threshold_ear
 		self.trigger_seconds = trigger_seconds
 		self.closed_start: float = 0.0
 		self.closed_time: float = 0.0
 		self.alerted: bool = False
+		self.custom_sound = custom_sound
 
 	def update(self, smoothed_ear: float, now: float) -> Tuple[str, float, bool]:
 		"""Return (status, closed_time, alert_started_this_frame)."""
@@ -44,6 +45,7 @@ class DrowsinessTimer:
 			self.closed_time = now - self.closed_start
 			if self.closed_time >= self.trigger_seconds and not self.alerted:
 				self.alerted = True
+				# custom_sound is currently ignored by default sound backend
 				play_alert_sound()
 				alert_started = True
 			status = "Drowsy"

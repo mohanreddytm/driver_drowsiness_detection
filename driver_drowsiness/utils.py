@@ -99,19 +99,23 @@ class AlertManager:
         self.sound_path = sound_path
         self.alert_thread = None
         self.last_alert_time = 0
-        self.cooldown = 3.0  # seconds
+        self.cooldown = 3.0  # seconds between alerts
         
     def play_alert(self):
-        """Play alert sound in a separate thread."""
-        if self.alert_thread and self.alert_thread.is_alive():
-            return
-            
-        self.alert_thread = threading.Thread(
-            target=playsound,
-            args=(self.sound_path,),
-            daemon=True
-        )
-        self.alert_thread.start()
+        """Play alert sound in a separate thread with cooldown."""
+        current_time = time.time()
+        
+        # Check if enough time has passed since last alert
+        if current_time - self.last_alert_time >= self.cooldown:
+            # Only start new alert if previous one is done
+            if not (self.alert_thread and self.alert_thread.is_alive()):
+                self.alert_thread = threading.Thread(
+                    target=playsound,
+                    args=(self.sound_path,),
+                    daemon=True
+                )
+                self.alert_thread.start()
+                self.last_alert_time = current_time
 
 def draw_debug_info(
     frame: np.ndarray,
@@ -121,21 +125,7 @@ def draw_debug_info(
     is_drowsy: bool,
     vit_conf: float
 ) -> np.ndarray:
-    """
-    Draw detection visualization and debug information.
-    
-    Args:
-        frame: Input frame
-        face_box: Face bounding box
-        eye_boxes: List of eye bounding boxes
-        ear_value: Current EAR value
-        is_drowsy: Current drowsiness state
-        vit_conf: Vision Transformer confidence score
-        
-    Returns:
-        Annotated frame
-    """
-    # Draw face box
+
     if face_box:
         x, y, w, h = face_box
         color = (0, 0, 255) if is_drowsy else (0, 255, 0)
