@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { startDetection, stopDetection, getStreamUrl, connectStatusSocket } from '../services/api'
 import StatusBadge from '../components/StatusBadge'
-import AlertMessageSettings from '../components/AlertMessageSettings'
+// import AlertMessageSettings from '../components/AlertMessageSettings'
 
 export default function App() {
   const [running, setRunning] = useState(false)
@@ -67,7 +67,6 @@ export default function App() {
         </div>
         <div style={{ width: 320 }}>
           {/* Custom Alert Message Settings */}
-          <AlertMessageSettings />
           
           {/* Detection Controls */}
           <div style={{ padding: 16, border: '1px solid #e0e0e0', borderRadius: 8 }}>
